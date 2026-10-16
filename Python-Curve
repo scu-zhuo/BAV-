@@ -1,0 +1,390 @@
+
+# ============================================================
+# BAV Patient-Specific Leaflet Surface Reconstruction
+# Environment: 3D Slicer Python Console
+# Method: Cubic B-spline curves + quadratic Bezier loft
+# Coordinates: World RAS, units: mm
+# ============================================================
+
+import os
+import csv
+import numpy as np
+import vtk
+import slicer
+
+from scipy.interpolate import splprep, splev, make_interp_spline
+
+# -------------------- 1. User settings --------------------
+
+OUTPUT_DIR = r"E:\BAV_Reconstruction\Patient01"
+
+# First run: reconstruct the fused leaflet only.
+# Add the second tuple when the non-fused curves are ready.
+LEAFLETS = [
+    ("Fused", "Attach_Fused", "Free_Fused", "Belly_Fused"),
+    # ("NonFused", "Attach_NonFused",
+    #  "Free_NonFused", "Belly_NonFused"),
+]
+
+N_U = 81           # Samples along the leaflet
+N_V = 25           # Samples from attachment to free edge
+N_CONTROL = 17     # Shared B-spline interpolation samples
+SMOOTH_S = 0.0     # Sum of squared residual tolerance, mm^2
+MAX_ENDPOINT_GAP = 5.0  # Maximum allowed commissure mismatch, mm
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# -------------------- 2. Read Slicer Markups --------------------
+
+def read_curve(name, required=True):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+
+    if node is None:
+        if required:
+            raise RuntimeError("Missing curve node: " + name)
+        return None
+
+    if not node.IsA("vtkMRMLMarkupsCurveNode"):
+        raise TypeError(name + " is not a Markups Curve node")
+
+    pts = []
+
+    for i in range(node.GetNumberOfControlPoints()):
+        xyz = [0.0, 0.0, 0.0]
+        node.GetNthControlPointPositionWorld(i, xyz)
+        pts.append(xyz)
+
+    pts = np.asarray(pts, dtype=float)
+
+    if len(pts) < 4:
+        raise ValueError(name + " needs at least 4 control points")
+
+    # Remove consecutive duplicate points.
+    distance = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    keep = np.r_[True, distance > 1e-5]
+    pts = pts[keep]
+
+    if len(pts) < 4:
+        raise ValueError(name + " has too few distinct points")
+
+    return pts
+
+
+def align_direction(reference, candidate):
+    """Orient candidate from the same C1 to C2 as reference."""
+    direct = (
+        np.linalg.norm(reference[0] - candidate[0]) +
+        np.linalg.norm(reference[-1] - candidate[-1])
+    )
+
+    reversed_cost = (
+        np.linalg.norm(reference[0] - candidate[-1]) +
+        np.linalg.norm(reference[-1] - candidate[0])
+    )
+
+    if reversed_cost < direct:
+        return candidate[::-1].copy()
+
+    return candidate.copy()
+
+
+def check_endpoints(reference, candidate, name):
+    d0 = np.linalg.norm(reference[0] - candidate[0])
+    d1 = np.linalg.norm(reference[-1] - candidate[-1])
+
+    print(f"{name}: endpoint gaps = {d0:.3f}, {d1:.3f} mm")
+
+    if max(d0, d1) > MAX_ENDPOINT_GAP:
+        raise ValueError(
+            f"{name}: endpoint mismatch too large. "
+            "Check the curve direction and commissures."
+        )
+
+
+# -------------------- 3. Fit cubic B-spline curves --------------------
+
+u_control = np.linspace(0.0, 1.0, N_CONTROL)
+u_dense = np.linspace(0.0, 1.0, N_U)
+v_dense = np.linspace(0.0, 1.0, N_V)
+
+
+def fit_curve_points(points):
+    """Fit a 3D parametric cubic B-spline using chord length."""
+    step = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    arc = np.r_[0.0, np.cumsum(step)]
+
+    if arc[-1] <= 1e-8:
+        raise ValueError("Curve length is nearly zero")
+
+    u = arc / arc[-1]
+
+    tck, _ = splprep(
+        points.T,
+        u=u,
+        s=SMOOTH_S,
+        k=3,
+        per=False
+    )
+
+    return np.column_stack(splev(u_control, tck))
+
+
+def common_spline(samples):
+    """Cubic B-spline using the same u knots for all curves."""
+    return make_interp_spline(
+        u_control, samples, k=3, axis=0
+    )(u_dense)
+
+
+# -------------------- 4. Construct leaflet surface --------------------
+
+def make_surface(attach, free, belly):
+    free = align_direction(attach, free)
+    check_endpoints(attach, free, "Free edge")
+
+    if belly is not None:
+        belly = align_direction(attach, belly)
+        check_endpoints(attach, belly, "Belly guide")
+
+    # Fit the three guide curves.
+    a_samples = fit_curve_points(attach)
+    f_samples = fit_curve_points(free)
+
+    b_samples = (
+        fit_curve_points(belly)
+        if belly is not None else None
+    )
+
+    # Shared anatomical commissure endpoints.
+    c1 = 0.5 * (attach[0] + free[0])
+    c2 = 0.5 * (attach[-1] + free[-1])
+
+    a_samples[0], a_samples[-1] = c1, c2
+    f_samples[0], f_samples[-1] = c1, c2
+
+    if b_samples is not None:
+        b_samples[0], b_samples[-1] = c1, c2
+
+    A = common_spline(a_samples)
+    F = common_spline(f_samples)
+
+    if b_samples is None:
+        B = 0.5 * (A + F)
+        print("No belly guide: generating a ruled surface.")
+    else:
+        B = common_spline(b_samples)
+        print("Using the belly guide curve.")
+
+    # Quadratic Bezier middle control curve.
+    P = 2.0 * B - 0.5 * (A + F)
+
+    v = v_dense[None, :, None]
+
+    S = (
+        ((1.0 - v) ** 2) * A[:, None, :] +
+        (2.0 * v * (1.0 - v)) * P[:, None, :] +
+        (v ** 2) * F[:, None, :]
+    )
+
+    return S, A, F, B
+
+
+# -------------------- 5. Create triangular mesh --------------------
+
+def surface_to_polydata(S):
+    """
+    Make an open triangular midsurface.
+
+    The first and last u rows collapse to commissure points,
+    so triangular fans are used instead of zero-area quads.
+    """
+    nu, nv, _ = S.shape
+
+    vtk_points = vtk.vtkPoints()
+    triangles = vtk.vtkCellArray()
+
+    def insert_point(p):
+        return vtk_points.InsertNextPoint(
+            float(p[0]), float(p[1]), float(p[2])
+        )
+
+    start_id = insert_point(S[0, 0])
+    ids = np.full((nu, nv), -1, dtype=int)
+
+    for i in range(1, nu - 1):
+        for j in range(nv):
+            ids[i, j] = insert_point(S[i, j])
+
+    end_id = insert_point(S[-1, 0])
+
+    def add_triangle(a, b, c):
+        p0 = np.array(vtk_points.GetPoint(int(a)))
+        p1 = np.array(vtk_points.GetPoint(int(b)))
+        p2 = np.array(vtk_points.GetPoint(int(c)))
+
+        twice_area = np.linalg.norm(
+            np.cross(p1 - p0, p2 - p0)
+        )
+
+        if twice_area < 1e-9:
+            return
+
+        cell = vtk.vtkTriangle()
+        cell.GetPointIds().SetId(0, int(a))
+        cell.GetPointIds().SetId(1, int(b))
+        cell.GetPointIds().SetId(2, int(c))
+        triangles.InsertNextCell(cell)
+
+    # First commissure fan.
+    for j in range(nv - 1):
+        add_triangle(start_id, ids[1, j], ids[1, j + 1])
+
+    # Interior surface strips.
+    for i in range(1, nu - 2):
+        for j in range(nv - 1):
+            a = ids[i, j]
+            b = ids[i + 1, j]
+            c = ids[i + 1, j + 1]
+            d = ids[i, j + 1]
+
+            add_triangle(a, b, c)
+            add_triangle(a, c, d)
+
+    # Last commissure fan.
+    for j in range(nv - 1):
+        add_triangle(
+            ids[nu - 2, j],
+            end_id,
+            ids[nu - 2, j + 1]
+        )
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_points)
+    poly.SetPolys(triangles)
+
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputData(poly)
+    normals.ConsistencyOn()
+    normals.SplittingOff()
+    normals.AutoOrientNormalsOff()
+    normals.Update()
+
+    output = vtk.vtkPolyData()
+    output.DeepCopy(normals.GetOutput())
+    return output
+
+
+# -------------------- 6. Save coordinates --------------------
+
+def save_points_csv(path, points):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["PointID", "R", "A", "S"])
+
+        for i, p in enumerate(points):
+            writer.writerow([i, *map(float, p)])
+
+
+# -------------------- 7. Reconstruct and export --------------------
+
+def reconstruct_leaflet(label, attach_name, free_name, belly_name):
+    attach = read_curve(attach_name)
+    free = read_curve(free_name)
+    belly = read_curve(belly_name, required=False)
+
+    save_points_csv(
+        os.path.join(OUTPUT_DIR, f"{label}_Attach_RAS.csv"),
+        attach
+    )
+
+    save_points_csv(
+        os.path.join(OUTPUT_DIR, f"{label}_Free_RAS.csv"),
+        free
+    )
+
+    if belly is not None:
+        save_points_csv(
+            os.path.join(OUTPUT_DIR, f"{label}_Belly_RAS.csv"),
+            belly
+        )
+
+    S, A, F, B = make_surface(attach, free, belly)
+    poly = surface_to_polydata(S)
+
+    model_name = f"BAV_{label}_Surface"
+
+    old = slicer.mrmlScene.GetFirstNodeByName(model_name)
+    if old is not None and old.IsA("vtkMRMLModelNode"):
+        slicer.mrmlScene.RemoveNode(old)
+
+    model = slicer.mrmlScene.AddNewNodeByClass(
+        "vtkMRMLModelNode", model_name
+    )
+
+    model.SetAndObservePolyData(poly)
+    model.CreateDefaultDisplayNodes()
+
+    display = model.GetDisplayNode()
+    display.SetColor(0.20, 0.70, 0.85)
+    display.SetOpacity(0.70)
+    display.SetVisibility(True)
+
+    # Save parameterization and sampled curves in RAS.
+    np.savez(
+        os.path.join(OUTPUT_DIR, f"{label}_Surface_RAS.npz"),
+        surface_RAS=S,
+        attachment_RAS=A,
+        free_edge_RAS=F,
+        belly_RAS=B,
+        u=u_dense,
+        v=v_dense
+    )
+
+    stl_path = os.path.join(
+        OUTPUT_DIR, f"{label}_Surface.stl"
+    )
+    vtp_path = os.path.join(
+        OUTPUT_DIR, f"{label}_Surface.vtp"
+    )
+
+    if not slicer.util.saveNode(model, stl_path):
+        raise RuntimeError("Failed to save STL: " + stl_path)
+
+    # Export separately to avoid changing the STL storage node.
+    if not slicer.util.exportNode(model, vtp_path):
+        raise RuntimeError("Failed to export VTP: " + vtp_path)
+
+    # Numerical surface area of the triangular mesh.
+    mesh_area = 0.0
+    for i in range(poly.GetNumberOfCells()):
+        cell = poly.GetCell(i)
+        p = [
+            np.array(cell.GetPoints().GetPoint(j))
+            for j in range(3)
+        ]
+        mesh_area += 0.5 * np.linalg.norm(
+            np.cross(p[1] - p[0], p[2] - p[0])
+        )
+
+    print("\n====== Reconstruction completed ======")
+    print("Leaflet:", label)
+    print("Mesh points:", poly.GetNumberOfPoints())
+    print("Triangles:", poly.GetNumberOfPolys())
+    print(f"Surface area: {mesh_area:.2f} mm^2")
+    print("Output folder:", OUTPUT_DIR)
+    print("STL:", stl_path)
+    print("VTP:", vtp_path)
+
+    return model
+
+
+# -------------------- 8. Run --------------------
+
+generated_models = []
+
+for config in LEAFLETS:
+    generated_models.append(reconstruct_leaflet(*config))
+
+slicer.app.processEvents()
+print("\nAll requested leaflets processed.")
