@@ -1,0 +1,1345 @@
+
+# ============================================================
+# BAV患者特异性瓣叶三维曲面重建
+#
+# 软件环境：3D Slicer内置Python环境
+#
+# 建模方法：
+# 1. 从3D Slicer读取瓣叶解剖曲线的控制点
+# 2. 统一曲线方向并检查交界端点
+# 3. 对三维曲线进行三次B样条拟合
+# 4. 利用二次Bézier插值生成瓣叶曲面
+# 5. 将参数曲面转换为三角形网格
+# 6. 在3D Slicer中显示并导出结果
+#
+# 坐标系统：3D Slicer世界坐标RAS
+# 坐标单位：mm
+#
+# 说明：
+# 生成的是瓣叶中面，不是具有厚度的实体瓣叶。
+# ============================================================
+
+
+# ============================================================
+# 第一部分：导入Python模块
+# ============================================================
+
+# os：操作文件夹及文件路径
+import os
+
+# csv：读取和写入CSV坐标文件
+import csv
+
+# NumPy：矩阵、数组和向量计算
+import numpy as np
+
+# VTK：构造三维三角网格
+import vtk
+
+# slicer：调用3D Slicer中的MRML场景和模型节点
+import slicer
+
+# SciPy中的B样条插值函数
+#
+# splprep：
+#   根据三维离散点拟合参数化B样条曲线
+#
+# splev：
+#   在指定参数位置计算B样条上的点
+#
+# make_interp_spline：
+#   根据采样点构造B样条插值曲线
+from scipy.interpolate import (
+    splprep,
+    splev,
+    make_interp_spline
+)
+
+
+# ============================================================
+# 第二部分：设置用户参数
+# ============================================================
+
+# 所有重建结果保存到这个文件夹。
+# 路径前加r，避免Windows反斜杠被识别为转义字符。
+#
+# 请根据自己的计算机修改路径。
+OUTPUT_DIR = r"E:\BAV_Reconstruction\Patient01"
+
+
+# 要重建的瓣叶及其Markups Curve节点名称
+#
+# 每个元组包含4个参数：
+#
+# 1. 瓣叶名称
+# 2. 附着缘节点名称
+# 3. 游离缘节点名称
+# 4. 瓣腹控制曲线节点名称
+#
+# 当前仅处理融合瓣叶。
+# 如果需要同时重建非融合瓣叶，可以取消下方注释。
+LEAFLETS = [
+    (
+        "Fused",
+        "Attach_Fused",
+        "Free_Fused",
+        "Belly_Fused"
+    ),
+
+    # (
+    #     "NonFused",
+    #     "Attach_NonFused",
+    #     "Free_NonFused",
+    #     "Belly_NonFused"
+    # ),
+]
+
+
+# -------------------- 网格采样参数 --------------------
+
+# N_U：
+# 沿瓣叶周向的采样点数量。
+#
+# u=0 对应第一个交界C1
+# u=1 对应第二个交界C2
+#
+# N_U越大，周向网格越密。
+N_U = 81
+
+
+# N_V：
+# 从附着缘到游离缘方向的采样点数量。
+#
+# v=0：附着缘
+# v=0.5：瓣腹控制曲线
+# v=1：游离缘
+#
+# N_V越大，该方向网格越密。
+N_V = 25
+
+
+# N_CONTROL：
+# 三维B样条曲线的公共重采样点数量。
+#
+# 注意：
+# 这不是Slicer中必须放置的控制点数量。
+# 原始Markups控制点可以多于或少于17个。
+#
+# 程序会先拟合原始曲线，
+# 再沿公共参数区间提取17个采样点。
+N_CONTROL = 17
+
+
+# 三维曲线拟合的平滑参数。
+#
+# s=0：
+# 尽量使初始拟合曲线通过原始控制点。
+#
+# s>0：
+# 允许拟合曲线偏离原始点，从而提高平滑程度。
+#
+# 该参数控制拟合残差，不是平滑半径。
+SMOOTH_S = 0.0
+
+
+# 两条曲线对应交界端点允许的最大距离。
+#
+# 单位：mm
+#
+# 如果附着缘和游离缘的对应端点距离大于5mm，
+# 程序将停止，并提示检查控制点。
+#
+# 注意：
+# 5mm仅用于初始错误检查，不能作为临床精度标准。
+MAX_ENDPOINT_GAP = 5.0
+
+
+# 创建输出文件夹。
+#
+# 如果文件夹已经存在，就直接使用。
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+
+# ============================================================
+# 第三部分：从3D Slicer中读取解剖曲线
+# ============================================================
+
+def read_curve(name, required=True):
+    """
+    根据节点名称读取Markups Curve控制点。
+
+    参数
+    ----
+    name : str
+        Slicer中Curve节点的名称。
+
+    required : bool
+        True：曲线必须存在，否则报错。
+        False：曲线不存在时返回None。
+
+    返回
+    ----
+    pts : ndarray
+        形状为(N, 3)的三维坐标数组。
+
+    坐标为世界RAS坐标，单位mm。
+    """
+
+    # 在当前MRML场景中查找指定名称的节点。
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+
+    # 判断节点是否存在。
+    if node is None:
+
+        # 必需曲线不存在时终止运行。
+        if required:
+            raise RuntimeError(
+                "Missing curve node: " + name
+            )
+
+        # 非必需曲线不存在时返回None。
+        return None
+
+    # 检查节点类型是否为Markups Curve。
+    if not node.IsA("vtkMRMLMarkupsCurveNode"):
+        raise TypeError(
+            name + " is not a Markups Curve node"
+        )
+
+    # 用于保存曲线上的原始控制点坐标。
+    pts = []
+
+    # 遍历该曲线的所有控制点。
+    for i in range(node.GetNumberOfControlPoints()):
+
+        # 存储单个三维坐标。
+        xyz = [0.0, 0.0, 0.0]
+
+        # 获取第i个控制点的世界RAS坐标。
+        #
+        # 注意这里读取的是Markups控制点，
+        # 而不是Slicer自动生成的密集插值点。
+        node.GetNthControlPointPositionWorld(
+            i,
+            xyz
+        )
+
+        # 将当前坐标加入列表。
+        pts.append(xyz)
+
+    # 将Python列表转换为NumPy数组。
+    #
+    # 例如：
+    # [[x1,y1,z1],
+    #  [x2,y2,z2],
+    #  [x3,y3,z3]]
+    pts = np.asarray(
+        pts,
+        dtype=float
+    )
+
+    # 三次B样条拟合至少需要4个不同点。
+    if len(pts) < 4:
+        raise ValueError(
+            name + " needs at least 4 control points"
+        )
+
+    # --------------------------------------------------------
+    # 删除相邻的重复点
+    # --------------------------------------------------------
+
+    # np.diff计算相邻控制点的坐标差。
+    #
+    # np.linalg.norm进一步计算欧氏距离。
+    distance = np.linalg.norm(
+        np.diff(pts, axis=0),
+        axis=1
+    )
+
+    # 保留首个点。
+    #
+    # 之后只保留与前一个点距离大于1e-5 mm的点。
+    keep = np.r_[
+        True,
+        distance > 1e-5
+    ]
+
+    # 使用布尔索引过滤重复点。
+    pts = pts[keep]
+
+    # 再次检查剩余有效点数。
+    if len(pts) < 4:
+        raise ValueError(
+            name + " has too few distinct points"
+        )
+
+    # 返回三维曲线控制点数组。
+    return pts
+
+
+# ============================================================
+# 第四部分：统一不同曲线的方向
+# ============================================================
+
+def align_direction(reference, candidate):
+    """
+    统一曲线的起点和终点方向。
+
+    reference：
+        参考曲线，通常为附着缘。
+
+    candidate：
+        需要检查方向的曲线，
+        通常为游离缘或瓣腹控制曲线。
+
+    目标：
+        所有曲线均按交界C1 → C2的方向排列。
+    """
+
+    # --------------------------------------------------------
+    # 情况1：保持candidate原始方向
+    # --------------------------------------------------------
+
+    # 比较两条曲线的起点距离与终点距离。
+    direct = (
+        np.linalg.norm(
+            reference[0] - candidate[0]
+        )
+        +
+        np.linalg.norm(
+            reference[-1] - candidate[-1]
+        )
+    )
+
+    # --------------------------------------------------------
+    # 情况2：将candidate方向反转
+    # --------------------------------------------------------
+
+    # candidate[-1]是末端点。
+    # candidate[0]是起点。
+    reversed_cost = (
+        np.linalg.norm(
+            reference[0] - candidate[-1]
+        )
+        +
+        np.linalg.norm(
+            reference[-1] - candidate[0]
+        )
+    )
+
+    # 判断哪一种方向能使端点更加接近。
+    if reversed_cost < direct:
+
+        # [::-1]表示将数组行顺序完全反转。
+        return candidate[::-1].copy()
+
+    # 如果原方向更合理，则保持不变。
+    return candidate.copy()
+
+
+def check_endpoints(reference, candidate, name):
+    """
+    检查两条曲线对应交界端点之间的距离。
+
+    如果任意一端距离超过阈值，
+    则认为可能存在解剖点对应错误。
+    """
+
+    # 第一端点距离。
+    d0 = np.linalg.norm(
+        reference[0] - candidate[0]
+    )
+
+    # 第二端点距离。
+    d1 = np.linalg.norm(
+        reference[-1] - candidate[-1]
+    )
+
+    # 在Python Console显示检查结果。
+    print(
+        f"{name}: endpoint gaps = "
+        f"{d0:.3f}, {d1:.3f} mm"
+    )
+
+    # 如果任意一端超过阈值，终止运行。
+    if max(d0, d1) > MAX_ENDPOINT_GAP:
+
+        raise ValueError(
+            f"{name}: endpoint mismatch too large. "
+            "Check the curve direction and commissures."
+        )
+
+
+# ============================================================
+# 第五部分：设置曲线和曲面的参数坐标
+# ============================================================
+
+# 原始曲线被重新采样到的公共u参数位置。
+#
+# 例如：
+# N_CONTROL=17时，
+# u_control包含0到1之间的17个均匀参数值。
+u_control = np.linspace(
+    0.0,
+    1.0,
+    N_CONTROL
+)
+
+
+# 曲线最终用于曲面建模时的u采样位置。
+#
+# N_U=81时，沿瓣叶周向生成81个位置。
+u_dense = np.linspace(
+    0.0,
+    1.0,
+    N_U
+)
+
+
+# 曲面的v方向采样位置。
+#
+# v=0：附着缘
+# v=1：游离缘
+v_dense = np.linspace(
+    0.0,
+    1.0,
+    N_V
+)
+
+
+# ============================================================
+# 第六部分：三维B样条曲线拟合
+# ============================================================
+
+def fit_curve_points(points):
+    """
+    将离散三维点拟合为三次B样条曲线。
+
+    拟合步骤：
+
+    1. 计算相邻点间距离。
+    2. 建立归一化弦长参数u。
+    3. 拟合三维三次B样条。
+    4. 在公共参数位置上重新采样。
+
+    返回：
+        (N_CONTROL, 3)的坐标数组。
+    """
+
+    # --------------------------------------------------------
+    # 1. 计算相邻控制点的三维距离
+    # --------------------------------------------------------
+
+    step = np.linalg.norm(
+        np.diff(points, axis=0),
+        axis=1
+    )
+
+    # --------------------------------------------------------
+    # 2. 计算累计弦长
+    # --------------------------------------------------------
+
+    # np.cumsum(step)计算累计长度。
+    #
+    # 在最前面添加0，表示曲线起点。
+    arc = np.r_[
+        0.0,
+        np.cumsum(step)
+    ]
+
+    # 检查曲线总长度是否接近0。
+    if arc[-1] <= 1e-8:
+        raise ValueError(
+            "Curve length is nearly zero"
+        )
+
+    # --------------------------------------------------------
+    # 3. 将弦长归一化到[0,1]
+    # --------------------------------------------------------
+
+    # u表示点沿曲线的相对位置。
+    #
+    # 起点：u=0
+    # 终点：u=1
+    u = arc / arc[-1]
+
+    # --------------------------------------------------------
+    # 4. 拟合三次B样条
+    # --------------------------------------------------------
+
+    # points.T：
+    # 将(N,3)数组转为(3,N)。
+    #
+    # k=3：
+    # 使用三次B样条。
+    #
+    # s=SMOOTH_S：
+    # 拟合残差控制参数。
+    #
+    # per=False：
+    # 表示开放曲线，不采用周期闭合拟合。
+    tck, _ = splprep(
+        points.T,
+        u=u,
+        s=SMOOTH_S,
+        k=3,
+        per=False
+    )
+
+    # --------------------------------------------------------
+    # 5. 在公共参数位置上提取曲线点
+    # --------------------------------------------------------
+
+    # splev根据参数u_control计算曲线坐标。
+    #
+    # 返回值由x、y、z三个数组组成。
+    #
+    # column_stack将它们组合成(N_CONTROL,3)。
+    return np.column_stack(
+        splev(u_control, tck)
+    )
+
+
+def common_spline(samples):
+    """
+    根据公共参数采样点构建三次B样条插值曲线。
+
+    作用：
+        将17个公共采样点插值为81个曲线点。
+
+    返回：
+        (N_U,3)坐标数组。
+    """
+
+    # make_interp_spline生成B样条对象。
+    #
+    # k=3表示三次样条。
+    #
+    # axis=0表示沿采样点所在的第0维进行插值。
+    #
+    # 最后的(u_dense)表示对样条进行求值。
+    return make_interp_spline(
+        u_control,
+        samples,
+        k=3,
+        axis=0
+    )(u_dense)
+
+
+# ============================================================
+# 第七部分：生成瓣叶参数化曲面
+# ============================================================
+
+def make_surface(attach, free, belly):
+    """
+    利用附着缘、游离缘和可选瓣腹曲线生成瓣叶中面。
+
+    输入：
+        attach：附着缘原始控制点
+        free：游离缘原始控制点
+        belly：瓣腹曲线原始控制点，可为None
+
+    返回：
+        S：瓣叶三维参数曲面
+        A：拟合后的附着缘
+        F：拟合后的游离缘
+        B：拟合后的瓣腹曲线
+
+    参数曲面：
+        S(u,v)
+    """
+
+    # --------------------------------------------------------
+    # 1. 统一游离缘方向
+    # --------------------------------------------------------
+
+    free = align_direction(
+        attach,
+        free
+    )
+
+    # 检查附着缘与游离缘端点距离。
+    check_endpoints(
+        attach,
+        free,
+        "Free edge"
+    )
+
+    # --------------------------------------------------------
+    # 2. 统一瓣腹控制曲线方向
+    # --------------------------------------------------------
+
+    # 如果未提供瓣腹曲线，则跳过。
+    if belly is not None:
+
+        belly = align_direction(
+            attach,
+            belly
+        )
+
+        check_endpoints(
+            attach,
+            belly,
+            "Belly guide"
+        )
+
+    # --------------------------------------------------------
+    # 3. 分别拟合三条B样条曲线
+    # --------------------------------------------------------
+
+    # 附着缘B样条重采样点。
+    a_samples = fit_curve_points(attach)
+
+    # 游离缘B样条重采样点。
+    f_samples = fit_curve_points(free)
+
+    # 可选瓣腹B样条重采样点。
+    #
+    # 如果belly=None，则b_samples也为None。
+    b_samples = (
+        fit_curve_points(belly)
+        if belly is not None
+        else None
+    )
+
+    # --------------------------------------------------------
+    # 4. 统一两条边界的交界端点
+    # --------------------------------------------------------
+
+    # 第一交界点：
+    # 取附着缘起点和游离缘起点的平均位置。
+    c1 = 0.5 * (
+        attach[0] + free[0]
+    )
+
+    # 第二交界点：
+    # 取两条曲线末端点的平均位置。
+    c2 = 0.5 * (
+        attach[-1] + free[-1]
+    )
+
+    # 强制附着缘两端落在C1与C2。
+    a_samples[0] = c1
+    a_samples[-1] = c2
+
+    # 强制游离缘两端落在相同交界位置。
+    f_samples[0] = c1
+    f_samples[-1] = c2
+
+    # 如果存在瓣腹控制曲线，
+    # 同样将其起点和终点约束为C1、C2。
+    if b_samples is not None:
+
+        b_samples[0] = c1
+        b_samples[-1] = c2
+
+    # --------------------------------------------------------
+    # 5. 生成81个点的连续B样条曲线
+    # --------------------------------------------------------
+
+    # A：最终附着缘。
+    A = common_spline(a_samples)
+
+    # F：最终游离缘。
+    F = common_spline(f_samples)
+
+    # --------------------------------------------------------
+    # 6. 确定瓣腹控制曲线B
+    # --------------------------------------------------------
+
+    if b_samples is None:
+
+        # 如果没有提供瓣腹曲线，
+        # 使用附着缘和游离缘的中点曲线。
+        #
+        # 此时曲面成为直纹曲面。
+        B = 0.5 * (A + F)
+
+        print(
+            "No belly guide: generating a ruled surface."
+        )
+
+    else:
+
+        # 如果存在瓣腹曲线，
+        # 直接利用样条插值获得B。
+        B = common_spline(b_samples)
+
+        print(
+            "Using the belly guide curve."
+        )
+
+    # --------------------------------------------------------
+    # 7. 计算二次Bézier控制曲线P
+    # --------------------------------------------------------
+
+    # 二次Bézier曲面表达式：
+    #
+    # S(u,v) =
+    # (1-v)^2 * A(u)
+    # + 2*v*(1-v) * P(u)
+    # + v^2 * F(u)
+    #
+    # 希望在v=0.5时经过瓣腹曲线B。
+    #
+    # 根据S(u,0.5)=B(u)，可求得：
+    #
+    # P(u)=2B(u)-0.5[A(u)+F(u)]
+    P = 2.0 * B - 0.5 * (A + F)
+
+    # --------------------------------------------------------
+    # 8. 构造v方向参数数组
+    # --------------------------------------------------------
+
+    # v_dense原来形状为(N_V,)。
+    #
+    # 增加两个维度后为(1,N_V,1)。
+    #
+    # 这样方便NumPy进行广播运算。
+    v = v_dense[None, :, None]
+
+    # --------------------------------------------------------
+    # 9. 生成瓣叶参数化曲面
+    # --------------------------------------------------------
+
+    # A[:,None,:]的形状为(N_U,1,3)。
+    #
+    # 与v数组广播运算后，
+    # 最终得到(N_U,N_V,3)。
+    S = (
+        ((1.0 - v) ** 2) * A[:, None, :]
+        +
+        (2.0 * v * (1.0 - v)) * P[:, None, :]
+        +
+        (v ** 2) * F[:, None, :]
+    )
+
+    # 返回曲面和三条连续曲线。
+    return S, A, F, B
+
+
+# ============================================================
+# 第八部分：将参数曲面转换为VTK三角网格
+# ============================================================
+
+def surface_to_polydata(S):
+    """
+    将参数化瓣叶曲面转换为vtkPolyData。
+
+    S的形状为：
+        (N_U,N_V,3)
+
+    注意：
+        两个交界位置会收缩为单点。
+
+    为避免生成零面积四边形，
+    两端采用三角扇形网格，
+    中间区域采用规则三角网格。
+    """
+
+    # 获取u方向和v方向采样数量。
+    nu, nv, _ = S.shape
+
+    # 创建VTK三维点集合。
+    vtk_points = vtk.vtkPoints()
+
+    # 创建VTK三角形单元集合。
+    triangles = vtk.vtkCellArray()
+
+    # --------------------------------------------------------
+    # 辅助函数：向VTK点集中插入坐标
+    # --------------------------------------------------------
+
+    def insert_point(p):
+
+        # 插入三维点，并返回该点的VTK编号。
+        return vtk_points.InsertNextPoint(
+            float(p[0]),
+            float(p[1]),
+            float(p[2])
+        )
+
+    # --------------------------------------------------------
+    # 1. 插入第一个交界点
+    # --------------------------------------------------------
+
+    # 在u=0时，所有v位置理论上都应位于C1。
+    #
+    # 因此只创建一个实际网格节点。
+    start_id = insert_point(
+        S[0, 0]
+    )
+
+    # 创建二维索引表。
+    #
+    # 用于记录参数网格每个位置对应的VTK节点ID。
+    #
+    # -1表示暂时没有对应的节点。
+    ids = np.full(
+        (nu, nv),
+        -1,
+        dtype=int
+    )
+
+    # --------------------------------------------------------
+    # 2. 插入曲面内部的所有节点
+    # --------------------------------------------------------
+
+    # 从第2个u位置开始，
+    # 直到倒数第2个u位置。
+    #
+    # 不包括两个端部交界点。
+    for i in range(1, nu - 1):
+
+        for j in range(nv):
+
+            # 插入当前曲面点。
+            point_id = insert_point(
+                S[i, j]
+            )
+
+            # 保存节点编号。
+            ids[i, j] = point_id
+
+    # --------------------------------------------------------
+    # 3. 插入第二个交界点
+    # --------------------------------------------------------
+
+    # u=1处的所有v位置收缩为C2。
+    end_id = insert_point(
+        S[-1, 0]
+    )
+
+    # --------------------------------------------------------
+    # 辅助函数：构造三角形
+    # --------------------------------------------------------
+
+    def add_triangle(a, b, c):
+
+        # 提取三个网格节点的三维坐标。
+        p0 = np.array(
+            vtk_points.GetPoint(int(a))
+        )
+
+        p1 = np.array(
+            vtk_points.GetPoint(int(b))
+        )
+
+        p2 = np.array(
+            vtk_points.GetPoint(int(c))
+        )
+
+        # 使用叉积计算三角形面积的2倍。
+        #
+        # |(p1-p0) × (p2-p0)| = 2A
+        twice_area = np.linalg.norm(
+            np.cross(
+                p1 - p0,
+                p2 - p0
+            )
+        )
+
+        # 如果三角形面积过小，则不创建。
+        #
+        # 防止产生退化三角形。
+        if twice_area < 1e-9:
+            return
+
+        # 创建VTK三角形单元。
+        cell = vtk.vtkTriangle()
+
+        # 设置三角形的三个节点编号。
+        cell.GetPointIds().SetId(0, int(a))
+        cell.GetPointIds().SetId(1, int(b))
+        cell.GetPointIds().SetId(2, int(c))
+
+        # 将三角形加入网格。
+        triangles.InsertNextCell(cell)
+
+    # --------------------------------------------------------
+    # 4. 构造第一个交界附近的三角扇
+    # --------------------------------------------------------
+
+    # C1只有一个节点。
+    #
+    # 利用C1与下一排采样点构造多个三角形。
+    for j in range(nv - 1):
+
+        add_triangle(
+            start_id,
+            ids[1, j],
+            ids[1, j + 1]
+        )
+
+    # --------------------------------------------------------
+    # 5. 构造瓣叶中间区域的三角网格
+    # --------------------------------------------------------
+
+    for i in range(1, nu - 2):
+
+        for j in range(nv - 1):
+
+            # 获取当前网格单元的四个角点。
+            a = ids[i, j]
+            b = ids[i + 1, j]
+            c = ids[i + 1, j + 1]
+            d = ids[i, j + 1]
+
+            # 每个四边形划分为两个三角形。
+            #
+            # 第一个：
+            # a-b-c
+            add_triangle(a, b, c)
+
+            # 第二个：
+            # a-c-d
+            add_triangle(a, c, d)
+
+    # --------------------------------------------------------
+    # 6. 构造第二个交界附近的三角扇
+    # --------------------------------------------------------
+
+    for j in range(nv - 1):
+
+        add_triangle(
+            ids[nu - 2, j],
+            end_id,
+            ids[nu - 2, j + 1]
+        )
+
+    # --------------------------------------------------------
+    # 7. 创建vtkPolyData曲面对象
+    # --------------------------------------------------------
+
+    poly = vtk.vtkPolyData()
+
+    # 写入三维节点。
+    poly.SetPoints(vtk_points)
+
+    # 写入三角面片。
+    poly.SetPolys(triangles)
+
+    # --------------------------------------------------------
+    # 8. 计算曲面法向量
+    # --------------------------------------------------------
+
+    normals = vtk.vtkPolyDataNormals()
+
+    normals.SetInputData(poly)
+
+    # 尽量统一相邻三角形的法向方向。
+    normals.ConsistencyOn()
+
+    # 不因锐角自动拆分网格节点。
+    normals.SplittingOff()
+
+    # 不自动决定整张开放曲面的正反方向。
+    normals.AutoOrientNormalsOff()
+
+    # 执行VTK法向量计算。
+    normals.Update()
+
+    # 创建最终输出对象。
+    output = vtk.vtkPolyData()
+
+    # 将结果深拷贝到输出对象。
+    output.DeepCopy(
+        normals.GetOutput()
+    )
+
+    return output
+
+
+# ============================================================
+# 第九部分：将三维坐标保存为CSV
+# ============================================================
+
+def save_points_csv(path, points):
+    """
+    保存三维曲线控制点。
+
+    文件格式：
+        PointID,R,A,S
+
+    单位：
+        mm
+
+    使用UTF-8-SIG编码，便于Excel读取。
+    """
+
+    # 打开目标文件，采用写入模式。
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        # CSV表头。
+        writer.writerow([
+            "PointID",
+            "R",
+            "A",
+            "S"
+        ])
+
+        # 遍历全部三维点。
+        for i, p in enumerate(points):
+
+            # 将点编号和RAS坐标写入CSV。
+            writer.writerow([
+                i,
+                *map(float, p)
+            ])
+
+
+# ============================================================
+# 第十部分：重建单片瓣叶并导出模型
+# ============================================================
+
+def reconstruct_leaflet(
+    label,
+    attach_name,
+    free_name,
+    belly_name
+):
+    """
+    执行一片瓣叶的完整重建流程。
+
+    输入：
+        label：瓣叶名称
+        attach_name：附着缘Curve节点名称
+        free_name：游离缘Curve节点名称
+        belly_name：瓣腹Curve节点名称
+
+    输出：
+        Slicer三维模型节点
+        CSV坐标文件
+        NPZ参数曲面数据
+        STL三角模型
+        VTP网格文件
+    """
+
+    # --------------------------------------------------------
+    # 1. 读取三条曲线的控制点
+    # --------------------------------------------------------
+
+    attach = read_curve(
+        attach_name
+    )
+
+    free = read_curve(
+        free_name
+    )
+
+    # 瓣腹控制曲线为可选项。
+    #
+    # 不存在时返回None，不报错。
+    belly = read_curve(
+        belly_name,
+        required=False
+    )
+
+    # --------------------------------------------------------
+    # 2. 保存原始控制点坐标
+    # --------------------------------------------------------
+
+    # 保存附着缘坐标。
+    save_points_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            f"{label}_Attach_RAS.csv"
+        ),
+        attach
+    )
+
+    # 保存游离缘坐标。
+    save_points_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            f"{label}_Free_RAS.csv"
+        ),
+        free
+    )
+
+    # 如果存在瓣腹控制曲线，则一并保存。
+    if belly is not None:
+
+        save_points_csv(
+            os.path.join(
+                OUTPUT_DIR,
+                f"{label}_Belly_RAS.csv"
+            ),
+            belly
+        )
+
+    # --------------------------------------------------------
+    # 3. 进行三维曲面重建
+    # --------------------------------------------------------
+
+    # S：曲面采样点
+    # A：拟合附着缘
+    # F：拟合游离缘
+    # B：拟合瓣腹曲线
+    S, A, F, B = make_surface(
+        attach,
+        free,
+        belly
+    )
+
+    # --------------------------------------------------------
+    # 4. 将参数曲面转换为VTK三角网格
+    # --------------------------------------------------------
+
+    poly = surface_to_polydata(S)
+
+    # --------------------------------------------------------
+    # 5. 在Slicer中创建模型节点
+    # --------------------------------------------------------
+
+    # 例如：
+    # label="Fused"
+    #
+    # model_name="BAV_Fused_Surface"
+    model_name = f"BAV_{label}_Surface"
+
+    # 查找是否已经存在同名模型。
+    old = slicer.mrmlScene.GetFirstNodeByName(
+        model_name
+    )
+
+    # 如果存在同名模型，
+    # 则先删除旧模型，避免重复显示。
+    if old is not None and old.IsA(
+        "vtkMRMLModelNode"
+    ):
+
+        slicer.mrmlScene.RemoveNode(old)
+
+    # 创建新的模型节点。
+    model = slicer.mrmlScene.AddNewNodeByClass(
+        "vtkMRMLModelNode",
+        model_name
+    )
+
+    # 将网格数据赋予模型节点。
+    model.SetAndObservePolyData(poly)
+
+    # 创建默认显示节点。
+    model.CreateDefaultDisplayNodes()
+
+    # --------------------------------------------------------
+    # 6. 设置曲面显示属性
+    # --------------------------------------------------------
+
+    display = model.GetDisplayNode()
+
+    # RGB颜色，数值范围0到1。
+    #
+    # 当前为青蓝色。
+    display.SetColor(
+        0.20,
+        0.70,
+        0.85
+    )
+
+    # 设置70%不透明度。
+    display.SetOpacity(0.70)
+
+    # 显示模型。
+    display.SetVisibility(True)
+
+    # --------------------------------------------------------
+    # 7. 保存曲面参数数据
+    # --------------------------------------------------------
+
+    # np.savez将多个NumPy数组存入一个NPZ文件。
+    #
+    # 这些数据采用世界RAS坐标，单位mm。
+    np.savez(
+        os.path.join(
+            OUTPUT_DIR,
+            f"{label}_Surface_RAS.npz"
+        ),
+
+        # 曲面三维采样点，形状(N_U,N_V,3)。
+        surface_RAS=S,
+
+        # 拟合后的附着缘。
+        attachment_RAS=A,
+
+        # 拟合后的游离缘。
+        free_edge_RAS=F,
+
+        # 拟合后的瓣腹控制曲线。
+        belly_RAS=B,
+
+        # 参数u与v。
+        u=u_dense,
+        v=v_dense
+    )
+
+    # --------------------------------------------------------
+    # 8. 定义STL和VTP文件路径
+    # --------------------------------------------------------
+
+    stl_path = os.path.join(
+        OUTPUT_DIR,
+        f"{label}_Surface.stl"
+    )
+
+    vtp_path = os.path.join(
+        OUTPUT_DIR,
+        f"{label}_Surface.vtp"
+    )
+
+    # --------------------------------------------------------
+    # 9. 导出STL三角曲面
+    # --------------------------------------------------------
+
+    # saveNode将模型保存到STL文件。
+    #
+    # Slicer默认模型文件坐标通常为LPS，
+    # 与上面的NPZ数组RAS坐标可能不同。
+    if not slicer.util.saveNode(
+        model,
+        stl_path
+    ):
+
+        raise RuntimeError(
+            "Failed to save STL: " + stl_path
+        )
+
+    # --------------------------------------------------------
+    # 10. 另外导出VTP文件
+    # --------------------------------------------------------
+
+    # exportNode直接导出节点数据，
+    # 不修改模型现有的场景存储节点配置。
+    #
+    # VTP适合保存VTK PolyData网格。
+    if not slicer.util.exportNode(
+        model,
+        vtp_path
+    ):
+
+        raise RuntimeError(
+            "Failed to export VTP: " + vtp_path
+        )
+
+    # --------------------------------------------------------
+    # 11. 计算曲面三角网格的面积
+    # --------------------------------------------------------
+
+    # 初始化总面积。
+    mesh_area = 0.0
+
+    # 遍历所有三角形单元。
+    for i in range(
+        poly.GetNumberOfCells()
+    ):
+
+        # 获取第i个单元。
+        cell = poly.GetCell(i)
+
+        # 获取三角形的三个顶点。
+        p = [
+            np.array(
+                cell.GetPoints().GetPoint(j)
+            )
+            for j in range(3)
+        ]
+
+        # 三角形面积公式：
+        #
+        # A = 0.5 * |(p1-p0) × (p2-p0)|
+        #
+        # 因为坐标单位是mm，
+        # 所以面积单位是mm²。
+        area = 0.5 * np.linalg.norm(
+            np.cross(
+                p[1] - p[0],
+                p[2] - p[0]
+            )
+        )
+
+        # 累加当前三角形面积。
+        mesh_area += area
+
+    # --------------------------------------------------------
+    # 12. 显示模型重建结果
+    # --------------------------------------------------------
+
+    print(
+        "\n====== Reconstruction completed ======"
+    )
+
+    print("Leaflet:", label)
+
+    print(
+        "Mesh points:",
+        poly.GetNumberOfPoints()
+    )
+
+    print(
+        "Triangles:",
+        poly.GetNumberOfPolys()
+    )
+
+    print(
+        f"Surface area: {mesh_area:.2f} mm^2"
+    )
+
+    print(
+        "Output folder:",
+        OUTPUT_DIR
+    )
+
+    print(
+        "STL:",
+        stl_path
+    )
+
+    print(
+        "VTP:",
+        vtp_path
+    )
+
+    # 返回创建的Slicer模型节点。
+    return model
+
+
+# ============================================================
+# 第十一部分：执行所有指定瓣叶的重建
+# ============================================================
+
+# 保存所有新生成的模型节点。
+generated_models = []
+
+# 遍历LEAFLETS中设置的每一片瓣叶。
+for config in LEAFLETS:
+
+    # config包含：
+    #
+    # (瓣叶名称, 附着缘, 游离缘, 瓣腹曲线)
+    #
+    # *config会将元组展开为4个函数参数。
+    model = reconstruct_leaflet(
+        *config
+    )
+
+    # 将生成的模型加入列表。
+    generated_models.append(model)
+
+# 处理Slicer中尚未更新的界面事件。
+slicer.app.processEvents()
+
+# 显示全部处理完成。
+print(
+    "\nAll requested leaflets processed."
+)
